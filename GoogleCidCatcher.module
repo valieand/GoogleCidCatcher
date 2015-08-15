@@ -1,0 +1,326 @@
+<?php
+
+/**
+ * Google Customer ID catcher
+ *
+ * This module gets Google Customer ID (CID) from browser cookie and saves it in user field user_google_cids.
+ * Field user_google_ids is created in user on install in order to store CIDs.
+ * CIDs are separated by comma.
+ *
+ * @author Andrey Valiev
+ *
+ * ProcessWire 2.x
+ * Copyright (C) 2011 by Ryan Cramer
+ * Licensed under GNU/GPL v2, see LICENSE.TXT
+ *
+ * http://www.processwire.com
+ * http://www.ryancramer.com
+ *
+ */
+class GoogleCidCatcher extends WireData implements Module, ConfigurableModule
+{
+    /**
+     * Return information about this module
+     *
+     * @return array
+     *
+     */
+    public static function getModuleInfo()
+    {
+        return array(
+            'title'      => 'Google Customer ID catcher',
+            'version'    => '0.0.1',
+            'summary'    => 'Saves Google Customer ID in user after login.',
+
+            'author'     => 'Andrey Valiev',
+            'href'       => '',
+
+            'permission' => array(),
+            'singular'   => true,
+            'autoload'   => true,
+            'permanent'  => false,
+
+            'requires'   => array('PHP>=5.5.0', 'ProcessWire>=2.6.1'),
+            'installs'   => array(),
+
+        );
+    }
+
+    /**
+     * Default configuration for this module
+     *
+     * The point of putting this in it's own function is so that you don't have to specify
+     * these defaults more than once.
+     *
+     * @return array
+     */
+    static public function getDefaultData()
+    {
+        return array(
+            'remove_fields_on_uninstall' => 0,
+        );
+    }
+
+    /**
+     * Populate the default config data
+     *
+     * ProcessWire will automatically overwrite it with anything the user has specifically configured.
+     * This is done in construct() rather than init() because ProcessWire populates config data after
+     * construct(), but before init().
+     *
+     */
+    public function __construct()
+    {
+        foreach(self::getDefaultData() as $key => $value)
+        {
+            $this->$key = $value;
+        }
+    }
+
+    /**
+     * Module configuration
+     *
+     * Note: this module isn't meant to be configurable in the usual way. While
+     * native features are used to define config inputfields, and user-provided
+     * config settings are stored just like regular config settings, the user
+     * only ever accesses them via the main module, VersionControl.
+     *
+     * @param array $data
+     *
+     * @return InputfieldWrapper
+     *
+     */
+    static public function getModuleConfigInputfields(array $data)
+    {
+        // this is a container for fields, basically like a fieldset
+        $fields = new InputfieldWrapper();
+
+        // merge default config settings (custom values overwrite defaults)
+        $defaults = self::getDefaultData();
+        $data = array_merge($defaults, $data);
+
+        // roles to skip
+        $field = wire()->modules->get('InputfieldPageAutocomplete');
+        $field->name  = 'skip_roles';
+        $field->label = _('Pool of admin Google CIDs');
+        $field->description = __('CIDs that are assigned to users with these roles form "pool of admin CIDs". These CIDs wont be catched in client loggedin with different account. It could be required for marketing purposes in order to separate admin (superuser) logins and other client logins.');
+        $field->labelFieldName = 'name';
+        $field->searchFields   = 'name';
+        $field->findPagesSelector = 'template=role';
+        $field->maxSelectedItems = 0;
+        if (isset($data[$field->name])) $field->value = $data[$field->name];
+        $fields->add($field);
+
+        // remove related fields when module is uninstalled?
+        $field = wire()->modules->get('InputfieldCheckbox');
+        $field->name  = 'remove_fields_on_uninstall';
+        $field->label = __('Remove related fields when this module is uninstalled?');
+        $field->description = __('If you want to remove related fields along with their data when this module is uninstalled, you should enable this option and save module configuration *before* uninstalling the module.');
+        if (isset($data[$field->name]) && $data[$field->name]) $field->checked = 'checked';
+        $fields->add($field);
+
+        return $fields;
+    }
+
+    /**
+     * Initialization function
+     *
+     */
+    public function init()
+    {
+        $this->addHookAfter('Session::login', $this, 'catchGoogleCid');
+    }
+
+    /**
+     * Catch Google CID
+     *
+     * @param HookEvent $event
+     *
+     */
+    public function catchGoogleCid(HookEvent $event)
+    {
+        $user = wire()->user;
+
+        $this->add_user_cid($user);
+    }
+
+    public function add_user_cid($user)
+    {
+        if ($user->id && !$user->isGuest())
+        {
+            $skip_cids  = $this->is_skip_user($user) ? [] : $this->get_skip_cids(); // if this user is from admin pool => no CIDs
+            $user_cids  = $this->get_user_cids($user);
+            $cookie_cid = $this->get_cookie_cid();
+
+            if (in_array($cookie_cid, $skip_cids)) return;
+            if (in_array($cookie_cid, $user_cids)) return;
+
+            $user->of(false);
+            $user->user_google_cids = implode(',', array_merge($user_cids, [$cookie_cid]));
+            $user->save('user_google_cids');
+        }
+    }
+
+    /**
+     * Get CIDs that should be skipped
+     *
+     * @return array    Array of string cids
+     *
+     */
+    public function get_skip_cids()
+    {
+        // there are no roles => no users => no CIDs to skip
+        if (count(array_filter($this->skip_roles))===0) return [];
+
+        $skip_users = $this->get_skip_users();
+
+        // there are no users => no CIDs to skip
+        if (count($skip_users)===0) return [];
+
+        // create and return array of skip cids
+        return $this->get_users_cids($skip_users);
+    }
+
+    public function is_skip_user($user)
+    {
+        $skip_users = $this->get_skip_users();
+
+        return $skip_users->has($user) ? true : false;
+    }
+
+    public function get_skip_users()
+    {
+        $selector = 'roles=' . implode('|', array_filter($this->skip_roles));
+
+        return wire()->users->find($selector);
+    }
+
+    /**
+     * Retrive CID from cookie
+     *
+     * @return string CID
+     *
+     */
+    public function get_cookie_cid()
+    {
+        list($version, $domainDepth, $cid1, $cid2) = split('[\.]', $this->input->cookie->_ga, 4);
+
+        return $cid1 || $cid2 ? $cid1 . '.' . $cid2 : null;
+    }
+
+    /**
+     * Retrive CIDs from users
+     *
+     * @return array Array of string CIDs
+     *
+     */
+    public function get_users_cids($users)
+    {
+        $cids = [];
+
+        foreach ($users as $user)
+        {
+            if (!$user->user_google_cids) continue;
+            $user_cids = $this->get_user_cids($user);
+            $cids = array_merge($cids, $user_cids);
+        }
+
+        return $cids;
+    }
+
+    /**
+     * Retrive CIDs from user
+     *
+     * @return array Array of string CIDs
+     *
+     */
+    public function get_user_cids($user)
+    {
+        return array_filter(explode(',', preg_replace('/\s+/', '', $user->user_google_cids)));
+    }
+
+    /**
+     * When module is installed, create required field and add it to user
+     * template(s)/fieldgroup(s).
+     *
+     * @throws WireException if field already exists, but is of wrong type
+     *
+     */
+    public function install()
+    {
+        $user_google_cids = wire()->fields->get('user_google_cids');
+
+        if (!$user_google_cids)
+        {
+            $user_google_cids        = new Field;
+            $user_google_cids->type  = wire()->modules->get('FieldtypeText');
+            $user_google_cids->name  = 'user_google_cids';
+            $user_google_cids->label = 'Google Customer IDs';
+            $user_google_cids->save();
+        }
+        else if ($user_google_cids->type != 'FieldtypeText')
+        {
+            throw new WireException("Field 'user_google_cids' exists, but is of wrong type!");
+        }
+
+        // add field to user template(s)/fieldgroup(s)
+        $template_ids = wire()->config->userTemplateIDs ?
+            wire()->config->userTemplateIDs :
+            array(wire()->config->userTemplateID);
+
+        foreach ($template_ids as $template_id)
+        {
+            $template = wire()->templates->get((int) $template_id);
+
+            if ($template->id)
+            {
+                $template->fields->add($user_google_cids);
+                $template->fields->save();
+            }
+        }
+
+    }
+
+    /**
+     * When module is uninstalled, remove related fields, but only if this is
+     * explicitly enabled via module configuration settings.
+     *
+     */
+    public function uninstall()
+    {
+        if ($this->remove_fields_on_uninstall)
+        {
+            $field_names = array(
+                'user_google_cids',
+            );
+
+            $template_ids = wire()->config->userTemplateIDs ?
+                wire()->config->userTemplateIDs :
+                array(wire()->config->userTemplateID);
+
+            foreach ($template_ids as $template_id)
+            {
+                $template = wire()->templates->get((int) $template_id);
+
+                if ($template->id)
+                {
+                    foreach ($field_names as $field_name)
+                    {
+                        $field = wire()->fields->get($field_name);
+                        if ($field) {
+                            $template->fields->remove($field);
+                            $template->fields->save();
+                        }
+                    }
+                }
+            }
+
+            foreach ($field_names as $field_name)
+            {
+                $field = wire()->fields->get($field_name);
+                if ($field) wire()->fields->delete($field);
+            }
+        }
+    }
+
+}
